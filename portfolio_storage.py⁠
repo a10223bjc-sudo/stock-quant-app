@@ -1,0 +1,64 @@
+import streamlit as st
+import pandas as pd
+from typing import Optional
+
+DEFAULT_HOLDINGS = [
+    {"代號": "2330.TW", "成本": 950.0, "股數": 1000},
+    {"代號": "2454.TW", "成本": 1200.0, "股數": 500},
+    {"代號": "2317.TW", "成本": 180.0, "股數": 2000},
+]
+
+def encode_holdings_to_query(df: pd.DataFrame) -> str:
+    records = []
+    for _, row in df.iterrows():
+        tkr = str(row.get("代號", "")).strip().upper()
+        cost = row.get("成本", 0)
+        shares = row.get("股數", 0)
+        if tkr and pd.notna(cost) and pd.notna(shares) and float(cost) > 0:
+            records.append(f"{tkr}:{float(cost):g}:{int(shares)}")
+    return ";".join(records)
+
+def decode_holdings_from_query(query_str: str) -> Optional[pd.DataFrame]:
+    try:
+        items = [x.strip() for x in query_str.split(";") if x.strip()]
+        parsed = []
+        for item in items:
+            parts = item.split(":")
+            if len(parts) == 3:
+                parsed.append({
+                    "代號": parts[0].strip().upper(),
+                    "成本": float(parts[1]),
+                    "股數": int(float(parts[2]))
+                })
+        return pd.DataFrame(parsed) if parsed else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_from_google_sheet_csv(sheet_csv_url: str) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_csv(sheet_csv_url)
+        required_cols = {"代號", "成本", "股數"}
+        if required_cols.issubset(set(df.columns)):
+            clean_df = df[["代號", "成本", "股數"]].dropna()
+            clean_df["代號"] = clean_df["代號"].astype(str).str.strip().str.upper()
+            clean_df["成本"] = clean_df["成本"].astype(float)
+            clean_df["股數"] = clean_df["股數"].astype(int)
+            return clean_df
+    except Exception as e:
+        st.warning(f"Google Sheets 讀取失敗，已切換為備援清單：{e}")
+    return None
+
+def get_initial_holdings() -> tuple[pd.DataFrame, str]:
+    if "p" in st.query_params and st.query_params["p"]:
+        df_url = decode_holdings_from_query(st.query_params["p"])
+        if df_url is not None and not df_url.empty:
+            return df_url, "🔗 已從你的專屬網址參數載入持股"
+
+    gsheet_url = st.secrets.get("GSHEET_CSV_URL", "") if hasattr(st, "secrets") else ""
+    if gsheet_url:
+        df_gsheet = load_from_google_sheet_csv(gsheet_url)
+        if df_gsheet is not None and not df_gsheet.empty:
+            return df_gsheet, "☁️ 已從 Google Sheets 雲端試算表同步最新持股"
+
+    return pd.DataFrame(DEFAULT_HOLDINGS), "📋 目前顯示預設範例持股（修改下方表格即可自動產生專屬記憶網址）"
