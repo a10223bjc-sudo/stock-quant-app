@@ -1,0 +1,108 @@
+import pandas as pd
+import numpy as np
+from typing import List, Dict
+from data_and_features import DataAndFeatureEngine
+from model_and_backtest import TimeSeriesModelAndBacktester
+
+class HoldingAndPortfolioAdvisor:
+    def __init__(self, horizon_days: int = 10, tp_pct: float = 0.06, sl_pct: float = 0.03):
+        self.horizon_days = horizon_days
+        self.tp_pct = tp_pct
+        self.sl_pct = sl_pct
+
+    def diagnose_existing_holding(
+        self, ticker: str, cost_price: float, shares: int
+    ) -> Dict[str, any]:
+        engine = DataAndFeatureEngine(ticker)
+        raw_df = engine.fetch_ohlcv()
+        feat_df = engine.compute_features(raw_df)
+        labeled_df = engine.create_triple_barrier_labels(
+            feat_df, self.horizon_days, self.tp_pct, self.sl_pct
+        )
+
+        trainer = TimeSeriesModelAndBacktester(horizon_days=self.horizon_days)
+        pred_df, latest_prob = trainer.train_and_predict_time_series(labeled_df)
+
+        latest = pred_df.iloc[-1]
+        current_price = float(latest['Close'])
+        atr = float(latest['ATR_14'])
+        ma20 = float(latest['MA_20'])
+        recent_20d_high = float(pred_df['High'].iloc[-20:].max())
+
+        hard_stop_price = round(cost_price - 2.0 * atr, 2)
+        trailing_stop_price = round(recent_20d_high - 2.5 * atr, 2)
+        effective_exit_price = round(max(hard_stop_price, trailing_stop_price), 2)
+
+        add_on_trigger_price = round(max(cost_price + 1.0 * atr, float(latest['MA_5'])), 2)
+        swing_target_price = round(current_price + 3.0 * atr, 2)
+        unrealized_pnl_pct = (current_price - cost_price) / cost_price * 100
+
+        if current_price <= effective_exit_price or latest_prob < 0.38:
+            action = "建議減碼 / 出場 (跌破防守價或模型勝率轉弱)"
+        elif (current_price >= cost_price + 1.0 * atr) and (latest_prob >= 0.60) and (current_price > ma20):
+            action = f"強勢續抱 / 可考慮於 {add_on_trigger_price} 元附近拉回時順勢加碼"
+        else:
+            action = "續抱觀察 (守穩出場防守價即可，暫不加碼)"
+
+        return {
+            '股票代號': ticker,
+            '目前市價': round(current_price, 2),
+            '持股成本': cost_price,
+            '帳面損益 (%)': round(unrealized_pnl_pct, 2),
+            'AI 預測波段勝率 (%)': round(latest_prob * 100, 1),
+            '建議出場防守價 (移動停損)': effective_exit_price,
+            '月線支撐價 (MA20)': round(ma20, 2),
+            '順勢加碼評估價': add_on_trigger_price,
+            '波段停利目標價': swing_target_price,
+            '操作建議': action
+        }
+
+    def screen_and_allocate_portfolio(
+        self, candidate_tickers: List[str], total_capital: float = 1000000, min_prob: float = 0.55
+    ) -> pd.DataFrame:
+        qualified_stocks = []
+
+        for ticker in candidate_tickers:
+            try:
+                engine = DataAndFeatureEngine(ticker)
+                df = engine.fetch_ohlcv()
+                feat_df = engine.compute_features(df)
+                labeled_df = engine.create_triple_barrier_labels(
+                    feat_df, self.horizon_days, self.tp_pct, self.sl_pct
+                )
+                trainer = TimeSeriesModelAndBacktester(horizon_days=self.horizon_days)
+                pred_df, latest_prob = trainer.train_and_predict_time_series(labeled_df)
+                latest = pred_df.iloc[-1]
+
+                if latest_prob >= min_prob and latest['MA_20_Bias'] > 0 and latest['MA_60_Bias'] > 0:
+                    close_p = float(latest['Close'])
+                    atr_val = float(latest['ATR_14'])
+                    atr_pct = float(latest['ATR_Pct'])
+                    qualified_stocks.append({
+                        'Ticker': ticker,
+                        'Close': round(close_p, 2),
+                        'Win_Prob': latest_prob,
+                        'ATR_Pct': atr_pct,
+                        'Suggested_Stop_Loss': round(close_p - 2.0 * atr_val, 2),
+                        'Suggested_Take_Profit': round(close_p + 3.0 * atr_val, 2),
+                        'Inv_Volatility': 1.0 / max(atr_pct, 0.005)
+                    })
+            except Exception as e:
+                print(f"略過 {ticker}: {e}")
+
+        if not qualified_stocks:
+            return pd.DataFrame()
+
+        port_df = pd.DataFrame(qualified_stocks).sort_values(by='Win_Prob', ascending=False)
+        port_df = port_df.head(5).copy()
+        total_inv_vol = port_df['Inv_Volatility'].sum()
+        port_df['Weight (%)'] = (port_df['Inv_Volatility'] / total_inv_vol * 100).round(1)
+        port_df['Allocated_Capital'] = (total_capital * (port_df['Weight (%)'] / 100.0)).round(0)
+        port_df['Suggested_Shares'] = (port_df['Allocated_Capital'] // port_df['Close']).astype(int)
+        port_df['Win_Prob (%)'] = (port_df['Win_Prob'] * 100).round(1)
+
+        return port_df[[
+            'Ticker', 'Close', 'Win_Prob (%)', 'Weight (%)',
+            'Allocated_Capital', 'Suggested_Shares',
+            'Suggested_Stop_Loss', 'Suggested_Take_Profit'
+        ]]
