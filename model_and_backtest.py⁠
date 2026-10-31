@@ -1,0 +1,154 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+from typing import Dict, Tuple
+
+FEATURE_COLS = [
+    'MA_5_Bias', 'MA_20_Bias', 'MA_60_Bias',
+    'MA_5_20_Diff', 'MA_20_60_Diff',
+    'RSI_14', 'MACD_Norm', 'MACD_Hist_Norm',
+    'ATR_Pct', 'Vol_Change_1D', 'Vol_Ratio_20D'
+]
+
+class TimeSeriesModelAndBacktester:
+    def __init__(
+        self,
+        horizon_days: int = 10,
+        prob_threshold: float = 0.55,
+        fee_rate: float = 0.001425,
+        tax_rate: float = 0.003
+    ):
+        self.horizon_days = horizon_days
+        self.prob_threshold = prob_threshold
+        self.fee_rate = fee_rate
+        self.tax_rate = tax_rate
+
+    def train_and_predict_time_series(
+        self, df: pd.DataFrame, initial_train_years: int = 3
+    ) -> Tuple[pd.DataFrame, float]:
+        clean_df = df.dropna(subset=FEATURE_COLS).copy()
+        labeled_df = clean_df.dropna(subset=['Target']).copy()
+        unlabeled_df = clean_df[clean_df['Target'].isna()].copy()
+
+        clean_df['Win_Prob'] = np.nan
+
+        trading_days_per_year = 252
+        initial_train_size = initial_train_years * trading_days_per_year
+        step_size = 63
+
+        total_labeled = len(labeled_df)
+        if total_labeled <= initial_train_size:
+            initial_train_size = int(total_labeled * 0.75)
+            step_size = total_labeled - initial_train_size
+
+        start_idx = 0
+        train_end_idx = initial_train_size
+
+        while train_end_idx < total_labeled:
+            test_end_idx = min(train_end_idx + step_size, total_labeled)
+            purge_train_end = max(start_idx, train_end_idx - self.horizon_days)
+            train_window = labeled_df.iloc[start_idx:purge_train_end]
+            test_window = labeled_df.iloc[train_end_idx:test_end_idx]
+
+            if len(train_window) > 50 and len(test_window) > 0:
+                X_train = train_window[FEATURE_COLS].values
+                y_train = train_window['Target'].values
+
+                pos_count = np.sum(y_train == 1)
+                neg_count = np.sum(y_train == 0)
+                scale_weight = (neg_count / pos_count) if pos_count > 0 else 1.0
+
+                model = XGBClassifier(
+                    n_estimators=120, max_depth=4, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8, scale_pos_weight=scale_weight,
+                    random_state=42, eval_metric='logloss'
+                )
+
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                model.fit(X_train_scaled, y_train)
+
+                X_test = test_window[FEATURE_COLS].values
+                X_test_scaled = scaler.transform(X_test)
+                probs = model.predict_proba(X_test_scaled)[:, 1]
+                clean_df.loc[test_window.index, 'Win_Prob'] = probs
+
+            train_end_idx += step_size
+
+        if not unlabeled_df.empty and len(labeled_df) > 0:
+            final_train = labeled_df.iloc[-initial_train_size:]
+            scaler_final = StandardScaler()
+            X_final_train = scaler_final.fit_transform(final_train[FEATURE_COLS].values)
+            y_final_train = final_train['Target'].values
+            
+            final_model = XGBClassifier(
+                n_estimators=120, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=42, eval_metric='logloss'
+            )
+            final_model.fit(X_final_train, y_final_train)
+
+            X_live = unlabeled_df[FEATURE_COLS].values
+            X_live_scaled = scaler_final.transform(X_live)
+            unlabeled_probs = final_model.predict_proba(X_live_scaled)[:, 1]
+            clean_df.loc[unlabeled_df.index, 'Win_Prob'] = unlabeled_probs
+
+        valid_bt_df = clean_df.dropna(subset=['Win_Prob']).copy()
+        latest_prob = float(valid_bt_df['Win_Prob'].iloc[-1]) if not valid_bt_df.empty else 0.5
+
+        return valid_bt_df, latest_prob
+
+    def run_backtest(self, test_df: pd.DataFrame, benchmark_ticker: str = "0050.TW") -> Dict:
+        bt = test_df.copy()
+        bt['Raw_Signal'] = np.where(
+            (bt['Win_Prob'] >= self.prob_threshold) & (bt['MA_20_Bias'] > 0), 1,
+            np.where((bt['Win_Prob'] < 0.40) | (bt['MA_20_Bias'] < -0.02), 0, np.nan)
+        )
+        bt['Position'] = bt['Raw_Signal'].ffill().fillna(0)
+        bt['Exec_Position'] = bt['Position'].shift(1).fillna(0)
+        bt['Asset_Return'] = bt['Close'].pct_change().fillna(0)
+
+        pos_diff = bt['Exec_Position'].diff().fillna(0)
+        buy_cost = np.where(pos_diff > 0, self.fee_rate, 0.0)
+        sell_cost = np.where(pos_diff < 0, self.fee_rate + self.tax_rate, 0.0)
+        bt['Trade_Cost'] = buy_cost + sell_cost
+
+        bt['Strategy_Return'] = bt['Exec_Position'] * bt['Asset_Return'] - bt['Trade_Cost']
+        bt['Strategy_Equity'] = (1 + bt['Strategy_Return']).cumprod()
+
+        start_dt = bt.index[0].strftime('%Y-%m-%d')
+        end_dt = (bt.index[-1] + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        bm_df = yf.download(benchmark_ticker, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
+        if isinstance(bm_df.columns, pd.MultiIndex):
+            bm_df.columns = bm_df.columns.get_level_values(0)
+
+        bt['Benchmark_Return'] = bm_df['Close'].reindex(bt.index).pct_change().fillna(0)
+        bt['Benchmark_Equity'] = (1 + bt['Benchmark_Return']).cumprod()
+
+        metrics = self._calculate_metrics(bt['Strategy_Return'], bt['Strategy_Equity'])
+        bm_metrics = self._calculate_metrics(bt['Benchmark_Return'], bt['Benchmark_Equity'])
+
+        return {
+            'backtest_df': bt,
+            'strategy_metrics': metrics,
+            'benchmark_metrics': bm_metrics
+        }
+
+    @staticmethod
+    def _calculate_metrics(returns: pd.Series, equity: pd.Series) -> Dict[str, float]:
+        total_ret = float(equity.iloc[-1] - 1.0)
+        n_days = len(returns)
+        cagr = float((equity.iloc[-1]) ** (252.0 / max(1, n_days)) - 1.0)
+        rolling_max = equity.cummax()
+        drawdown = (equity - rolling_max) / rolling_max
+        mdd = float(drawdown.min())
+        vol = float(returns.std() * np.sqrt(252))
+        sharpe = float((returns.mean() * 252) / vol) if vol > 0 else 0.0
+
+        return {
+            '累積報酬率 (%)': round(total_ret * 100, 2),
+            '年化報酬率 (%)': round(cagr * 100, 2),
+            '最大回撤 MDD (%)': round(mdd * 100, 2),
+            '夏普值 (Sharpe)': round(sharpe, 2)
+        }
